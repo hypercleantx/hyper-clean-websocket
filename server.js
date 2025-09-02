@@ -307,3 +307,17 @@ process.on('SIGTERM', () => {
 });
 
 module.exports = app;
+// SMS webhook endpoint
+app.post('/sms', (req, res) => {
+  const { From, Body, To } = req.body;
+  
+  console.log(`SMS from ${From}: ${Body}`);
+  
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>Thank you for contacting Hyper Clean TX! We'll respond shortly. For immediate service, please call ${process.env.BUSINESS_PHONE || '+18327848994'}.</Message>
+</Response>`;
+
+  res.type('text/xml');
+  res.send(twiml);
+});
