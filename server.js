@@ -1,295 +1,309 @@
-server.js
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { body, validationResult } = require('express-validator');
-require('dotenv').config();
+const twilio = require('twilio');
+const OpenAI = require('openai');
 
 const app = express();
-const PORT = process.env.PORT || 10000;
 
-// Security Configuration
-const CONFIG = {
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY,
-  TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID,
-  TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN,
-  BUSINESS_PHONE: process.env.BUSINESS_PHONE || '+18327848994',
-  ENVIRONMENT: process.env.NODE_ENV || 'production'
+// Configuration from environment variables
+const config = {
+  port: process.env.PORT || 10000,
+  openai: {
+    apiKey: process.env.OPENAI_API_KEY,
+    model: 'gpt-4',
+    voice: 'alloy'
+  },
+  twilio: {
+    accountSid: process.env.TWILIO_ACCOUNT_SID,
+    authToken: process.env.TWILIO_AUTH_TOKEN,
+    phone: process.env.BUSINESS_PHONE
+  }
 };
 
-// Validate required environment variables
-const requiredEnvVars = ['OPENAI_API_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'];
-const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+// Initialize services
+const openai = new OpenAI({
+  apiKey: config.openai.apiKey
+});
 
-if (missingVars.length > 0) {
-  console.error('❌ Missing required environment variables:', missingVars);
-  process.exit(1);
-}
+const twilioClient = twilio(config.twilio.accountSid, config.twilio.authToken);
 
-// Security Middleware
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "https:"],
-    },
-  },
-}));
+// Security middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.',
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 20, // 20 requests per minute
+  message: 'Too many requests, please try again later.'
 });
 
-app.use(limiter);
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use('/voice', limiter);
+app.use('/sms', limiter);
 
-// Import Services
-const OpenAIService = require('./services/openai');
-const TwilioService = require('./services/twilio');
-const EmotionService = require('./services/emotion');
-const logger = require('./utils/logger');
+// Emotion detection function
+function detectCustomerEmotion(message, context = {}) {
+  const emotions = {
+    frustrated: {
+      keywords: ['frustrated', 'annoyed', 'upset', 'angry', 'terrible', 'horrible', 'worst', 'hate', 'mad'],
+      urgency: ['need now', 'asap', 'urgent', 'emergency', 'right away', 'immediately'],
+      complaints: ['cancel', 'refund', 'disappointed', 'unacceptable', 'terrible service'],
+      weight: 0
+    },
+    excited: {
+      keywords: ['excited', 'amazing', 'perfect', 'love', 'great', 'awesome', 'fantastic', 'wonderful'],
+      enthusiasm: ['yes!', 'definitely', 'absolutely', 'can\'t wait', 'so happy'],
+      weight: 0
+    },
+    concerned: {
+      keywords: ['worried', 'concerned', 'nervous', 'unsure', 'hesitant', 'doubt', 'confused'],
+      questions: ['what if', 'are you sure', 'guarantee', 'promise', 'how do I know'],
+      weight: 0
+    },
+    price_sensitive: {
+      keywords: ['expensive', 'cost', 'price', 'budget', 'afford', 'cheap', 'discount', 'deal'],
+      comparison: ['other companies', 'competitors', 'cheaper option', 'better price'],
+      weight: 0
+    }
+  };
 
-// Initialize Services
-const openaiService = new OpenAIService(CONFIG.OPENAI_API_KEY);
-const twilioService = new TwilioService(CONFIG.TWILIO_ACCOUNT_SID, CONFIG.TWILIO_AUTH_TOKEN);
-const emotionService = new EmotionService();
+  const text = message.toLowerCase();
+  let maxWeight = 0;
+  let detectedEmotion = 'neutral';
 
-// Health Check Endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    environment: CONFIG.ENVIRONMENT
+  // Calculate weighted scores
+  Object.keys(emotions).forEach(emotion => {
+    Object.keys(emotions[emotion]).forEach(category => {
+      if (category !== 'weight') {
+        emotions[emotion][category].forEach(keyword => {
+          if (text.includes(keyword)) {
+            emotions[emotion].weight += (category === 'keywords') ? 1 : 1.5;
+          }
+        });
+      }
+    });
+
+    if (emotions[emotion].weight > maxWeight) {
+      maxWeight = emotions[emotion].weight;
+      detectedEmotion = emotion;
+    }
   });
-});
 
-// Twilio Voice Webhook
+  return {
+    emotion: detectedEmotion,
+    confidence: Math.min(maxWeight / 3, 1),
+    weights: emotions
+  };
+}
+
+// Generate OpenAI response
+async function generateAIResponse(emotion, userMessage, context = {}) {
+  try {
+    const emotionPrompts = {
+      frustrated: "You are a calm, understanding customer service representative for Hyper Clean TX, a premium cleaning service in Houston. The customer is frustrated. Respond with empathy, acknowledge their concerns, and focus on solutions. Keep responses under 100 words.",
+      excited: "You are an enthusiastic customer service representative for Hyper Clean TX. The customer is excited about your services. Match their energy while being professional. Discuss your flat-rate pricing ($139-289) and Houston service areas. Keep responses under 100 words.",
+      concerned: "You are a patient, reassuring customer service representative for Hyper Clean TX. The customer has concerns. Provide clear, confident answers and reassurance about your professional service. Keep responses under 100 words.",
+      price_sensitive: "You are a value-focused customer service representative for Hyper Clean TX. The customer is price-conscious. Emphasize your competitive flat rates, quality service, and value proposition. Mention that contractors assume all risk, zero downtime costs. Keep responses under 100 words.",
+      neutral: "You are a professional customer service representative for Hyper Clean TX, a Houston cleaning service. Provide helpful, friendly service information. Keep responses under 100 words."
+    };
+
+    const systemPrompt = emotionPrompts[emotion] || emotionPrompts.neutral;
+
+    const completion = await openai.chat.completions.create({
+      model: config.openai.model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage }
+      ],
+      max_tokens: 150,
+      temperature: 0.7
+    });
+
+    return completion.choices[0].message.content;
+  } catch (error) {
+    console.error('OpenAI API error:', error);
+    return "Thank you for calling Hyper Clean TX. We're here to help with all your cleaning needs in Houston. How can we assist you today?";
+  }
+}
+
+// Voice webhook handler
 app.post('/voice', async (req, res) => {
   try {
-    const { From, To, CallSid, Digits } = req.body;
+    console.log('Incoming voice call:', req.body);
     
-    logger.info(`Incoming call from ${From} to ${To}, CallSid: ${CallSid}`);
+    const { From, To, CallSid, Digits } = req.body;
     
     let twimlResponse;
     
     if (!Digits) {
-      // Main menu
+      // Initial call - main menu
       twimlResponse = `
 
   
-    Hello! Thank you for calling Hyper Clean TX, Houston's premier cleaning service.
-    Press 1 for new cleaning service quotes.
-    Press 2 to speak with customer support.
-    Press 3 to schedule or modify an appointment.
-    Press 0 to speak with a representative.
+    Hello! Thank you for calling Hyper Clean TX, Houston's premier cleaning service. 
+    For new cleaning service and pricing information, press 1.
+    To speak with customer support, press 2.
+    To schedule an appointment, press 3.
+    To hear our service areas, press 4.
   
-  We didn't receive your selection. Please call back and make a selection from our menu. Thank you for choosing Hyper Clean TX!
+  We didn't receive your selection. Please call back and make a selection. Thank you for choosing Hyper Clean TX!
 `;
     } else {
       // Handle menu selection
-      twimlResponse = await handleMenuSelection(Digits, From, CallSid);
+      let responseMessage = "";
+      
+      switch (Digits) {
+        case '1':
+          responseMessage = "Our flat-rate cleaning starts at $139 for studios, $179 for 1-2 bedrooms, $189 for 3 bedrooms, and up to $289 for larger homes. We serve River Oaks, Memorial, Bellaire, and surrounding Houston areas. Would you like to schedule a cleaning?";
+          break;
+        case '2':
+          responseMessage = "You've reached customer support for Hyper Clean TX. Our team is here to help with any questions about our services, scheduling, or billing. How can we assist you today?";
+          break;
+        case '3':
+          responseMessage = "Great! Let's schedule your cleaning appointment. We have availability throughout the week in Houston. What area are you located in, and what type of home do you have?";
+          break;
+        case '4':
+          responseMessage = "Hyper Clean TX proudly serves River Oaks, Memorial Village, Bellaire, West University, Museum District, Montrose, and surrounding Houston neighborhoods. We're expanding our service areas regularly!";
+          break;
+        default:
+          responseMessage = "I didn't understand that selection. Please call back and press 1 for pricing, 2 for support, 3 for scheduling, or 4 for service areas.";
+      }
+
+      // Generate AI-enhanced response
+      const emotion = detectCustomerEmotion(responseMessage);
+      const aiResponse = await generateAIResponse(emotion.emotion, responseMessage, { digits: Digits });
+      
+      twimlResponse = `
+
+  ${aiResponse}
+  
+    Press 1 to return to the main menu, or stay on the line to speak with our team.
+  
+  Thank you for calling Hyper Clean TX. Have a great day!
+`;
     }
-    
-    res.type('text/xml');
+
+    res.set('Content-Type', 'text/xml');
     res.send(twimlResponse);
     
   } catch (error) {
-    logger.error('Voice webhook error:', error);
+    console.error('Voice webhook error:', error);
     
-    const fallbackTwiML = `
+    const fallbackTwiml = `
 
-  We're experiencing technical difficulties. Please call back in a few minutes or visit our website. Thank you for choosing Hyper Clean TX.
+  Thank you for calling Hyper Clean TX. We're experiencing technical difficulties. Please call back shortly or visit our website. Thank you!
 `;
     
-    res.type('text/xml');
-    res.send(fallbackTwiML);
+    res.set('Content-Type', 'text/xml');
+    res.send(fallbackTwiml);
   }
 });
 
-// Voice Input Handler
-app.post('/voice-input', async (req, res) => {
-  try {
-    const { Digits, From, CallSid } = req.body;
-    const twimlResponse = await handleMenuSelection(Digits, From, CallSid);
-    
-    res.type('text/xml');
-    res.send(twimlResponse);
-    
-  } catch (error) {
-    logger.error('Voice input error:', error);
-    
-    const errorTwiML = `
-
-  Sorry, we encountered an error processing your request. Please try again or call back later.
-`;
-    
-    res.type('text/xml');
-    res.send(errorTwiML);
-  }
-});
-
-// SMS Webhook
+// SMS webhook handler
 app.post('/sms', async (req, res) => {
   try {
+    console.log('Incoming SMS:', req.body);
+    
     const { From, Body, MessageSid } = req.body;
     
-    logger.info(`SMS from ${From}: ${Body}`);
-    
-    // Detect emotion in SMS
-    const emotion = emotionService.detectEmotion(Body);
+    // Detect emotion from SMS
+    const emotion = detectCustomerEmotion(Body);
     
     // Generate AI response
-    const aiResponse = await openaiService.generateResponse(Body, emotion, 'sms');
+    const aiResponse = await generateAIResponse(emotion.emotion, Body, { channel: 'sms' });
     
-    // Send SMS response
-    await twilioService.sendSMS(From, aiResponse);
+    // Create TwiML response
+    const twimlResponse = `
+
+  ${aiResponse}
+`;
     
-    res.status(200).send('OK');
+    res.set('Content-Type', 'text/xml');
+    res.send(twimlResponse);
     
   } catch (error) {
-    logger.error('SMS webhook error:', error);
-    res.status(500).send('Error processing SMS');
+    console.error('SMS webhook error:', error);
+    
+    const fallbackTwiml = `
+
+  Thanks for contacting Hyper Clean TX! We'll get back to you shortly. Call us for immediate assistance!
+`;
+    
+    res.set('Content-Type', 'text/xml');
+    res.send(fallbackTwiml);
   }
 });
 
-// Menu Selection Handler
-async function handleMenuSelection(digits, from, callSid) {
-  try {
-    switch (digits) {
-      case '1':
-        // New cleaning service
-        return `
-
-  Thank you for your interest in our cleaning services! 
-  Our flat-rate pricing starts at $139 for studios, $179 for 1-2 bedrooms, and $189 for 3 bedrooms.
-  We serve River Oaks, Memorial, Bellaire, and surrounding Houston areas.
-  Please stay on the line to speak with a representative who can provide a personalized quote.
-  ${CONFIG.BUSINESS_PHONE}
-  Our representatives are currently busy. Please call back or visit our website to schedule online. Thank you!
-`;
-
-      case '2':
-        // Customer support
-        const emotion = emotionService.detectEmotion('customer support request');
-        const supportResponse = await openaiService.generateResponse(
-          'Customer selected customer support', 
-          emotion, 
-          'voice'
-        );
-        
-        return `
-
-  ${supportResponse}
-  Connecting you to our customer support team now.
-  ${CONFIG.BUSINESS_PHONE}
-  Our support team is currently busy. Please leave a message after the tone.
-  
-`;
-
-      case '3':
-        // Scheduling
-        return `
-
-  For appointment scheduling and modifications, please stay on the line to speak with our scheduling coordinator.
-  We offer flexible scheduling Monday through Saturday, with same-day service available in most Houston areas.
-  ${CONFIG.BUSINESS_PHONE}
-  Our scheduling team is currently busy. Please call back or visit our website to schedule online.
-`;
-
-      case '0':
-        // Representative
-        return `
-
-  Connecting you to a Hyper Clean TX representative now.
-  ${CONFIG.BUSINESS_PHONE}
-  All representatives are currently busy. Please call back or leave a message after the tone.
-  
-`;
-
-      default:
-        return `
-
-  Invalid selection. Please call back and press 1 for new service, 2 for support, 3 for scheduling, or 0 for a representative.
-`;
-    }
-  } catch (error) {
-    logger.error('Menu selection error:', error);
-    throw error;
-  }
-}
-
-// Recording Handler
-app.post('/handle-recording', async (req, res) => {
-  try {
-    const { RecordingUrl, From, TranscriptionText } = req.body;
-    
-    logger.info(`Recording received from ${From}: ${RecordingUrl}`);
-    
-    if (TranscriptionText) {
-      // Process transcription with AI
-      const emotion = emotionService.detectEmotion(TranscriptionText);
-      const response = await openaiService.generateResponse(TranscriptionText, emotion, 'voice');
-      
-      // Could send follow-up SMS or email here
-      logger.info(`AI Analysis: ${response}`);
-    }
-    
-    const twiML = `
-
-  Thank you for your message. A member of our team will get back to you within 24 hours. Have a great day!
-`;
-    
-    res.type('text/xml');
-    res.send(twiML);
-    
-  } catch (error) {
-    logger.error('Recording handler error:', error);
-    res.status(500).send('Error processing recording');
-  }
-});
-
-// API Endpoints
-app.get('/api/status', (req, res) => {
+// Health check endpoint
+app.get('/health', (req, res) => {
   res.json({
-    status: 'operational',
-    services: {
-      openai: !!CONFIG.OPENAI_API_KEY,
-      twilio: !!CONFIG.TWILIO_ACCOUNT_SID,
-    },
-    timestamp: new Date().toISOString()
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Hyper Clean TX - Voice & SMS Automation Server',
+    status: 'running',
+    endpoints: {
+      voice: '/voice (POST)',
+      sms: '/sms (POST)',
+      health: '/health (GET)'
+    }
   });
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  logger.error('Unhandled error:', error);
-  res.status(500).json({ error: 'Internal server error' });
+  console.error('Server error:', error);
+  res.status(500).json({
+    error: 'Internal server error',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Endpoint not found',
+    path: req.path,
+    method: req.method
+  });
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Hyper Clean TX Server running on port ${PORT}`);
-  console.log(`✅ Environment: ${CONFIG.ENVIRONMENT}`);
-  console.log(`🔒 Security: API keys loaded from environment variables`);
+const server = app.listen(config.port, () => {
+  console.log(`🚀 Hyper Clean TX Server running on port ${config.port}`);
+  console.log(`📞 Twilio Voice webhook: /voice`);
+  console.log(`📱 Twilio SMS webhook: /sms`);
+  console.log(`❤️ Health check: /health`);
   
-  // Validate services on startup
-  if (!CONFIG.OPENAI_API_KEY) console.warn('⚠️  OpenAI API key not configured');
-  if (!CONFIG.TWILIO_ACCOUNT_SID) console.warn('⚠️  Twilio credentials not configured');
+  // Validate environment variables
+  if (!config.openai.apiKey) {
+    console.warn('⚠️  OPENAI_API_KEY not set');
+  }
+  if (!config.twilio.accountSid || !config.twilio.authToken) {
+    console.warn('⚠️  Twilio credentials not set');
+  }
+  
+  console.log('✅ Server initialization complete');
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
 });
 
 module.exports = app;
