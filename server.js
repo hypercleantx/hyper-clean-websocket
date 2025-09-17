@@ -9,7 +9,8 @@ const app = express();
 
 // Configuration from environment variables
 const config = {
-  port: process.env.PORT || 10000,
+     port: process.env.PORT || 3000,
+  
   openai: {
     apiKey: process.env.OPENAI_API_KEY,
     model: 'gpt-4',
@@ -321,3 +322,4 @@ app.post('/sms', (req, res) => {
   res.type('text/xml');
   res.send(twiml);
 });
+
